@@ -1,0 +1,84 @@
+# Default configuration for WhaleSound Clusters
+# Copy this to configs/local.yaml and modify as needed
+
+# Data source
+data:
+  gcs_bucket: "noaa-passive-bioacoustic"
+  gcs_prefix: "sanctsound/audio"
+  download_method: "python"  # "python" or "gsutil"
+  max_files: 200
+  date_range: null  # null or {"start": "2020-01-01", "end": "2020-12-31"}
+  output_dir: "data/downloads"
+  skip_existing: false  # If true, skip downloading files that already exist locally
+  
+# Audio processing
+audio:
+  sample_rate: 4000  # Hz - 4kHz preserves humpback harmonics well
+  bandpass:
+    enabled: true
+    fmin: 20  # Hz
+    fmax: 2000  # Hz
+  
+# Segmentation
+segmentation:
+  frame_length_ms: 50  # milliseconds
+  hop_length_ms: 25
+  energy_threshold: 0.01  # RMS threshold (normalized)
+  min_duration_ms: 500  # minimum segment duration
+  max_duration_ms: 3000  # maximum segment duration
+  merge_gap_ms: 200  # merge segments closer than this
+  output_dir: "data/segments"
+  
+# Feature extraction
+features:
+  method: "logmel"  # "logmel" or "embedding"
+  output_dir: "data/features"
+  use_full_audio: false  # If true, skip segmentation and use full audio files
+  audio_dir: null  # Directory with full audio files (null = use data.output_dir)
+  
+  # Log-mel spectrogram parameters
+  logmel:
+    n_mels: 64
+    fmin: 20
+    fmax: 2000
+    hop_length: 512
+    n_fft: 2048
+    summarize: "mean_std"  # "mean_std" or "flatten"
+    
+  # Embedding parameters (optional)
+  embedding:
+    model: "openl3"  # placeholder - implement if needed
+    layer: -1
+    
+# Clustering
+clustering:
+  random_seed: 42
+  output_dir: "data/clusters"
+  
+  # UMAP parameters
+  umap:
+    n_components: 2
+    n_neighbors: 15
+    min_dist: 0.1
+    metric: "euclidean"
+    random_state: 42
+    
+  # HDBSCAN parameters
+  hdbscan:
+    min_cluster_size: 5  # Lower to find more clusters (whale sounds have variety)
+    min_samples: 3  # Lower to allow smaller but distinct clusters
+    cluster_selection_method: "leaf"  # "leaf" finds more clusters than "eom"
+    metric: "euclidean"
+    
+  # Exemplars
+  exemplars:
+    n_per_cluster: 5
+    method: "centroid"  # "centroid" or "diverse"
+
+# UI
+ui:
+  port: 8501
+  host: "localhost"
+  max_segments_display: 10000
+  default_cluster_filter: null  # null or list of cluster IDs
+

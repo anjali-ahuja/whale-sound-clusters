@@ -1,0 +1,68 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+venv/
+env/
+ENV/
+.venv
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Data (keep structure)
+data/
+!data/.gitkeep
+!data/segments/.gitkeep
+!data/features/.gitkeep
+!data/clusters/.gitkeep
+!data/downloads/.gitkeep
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# Logs
+*.log
+logs/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Project specific
+*.wav
+*.npz
+*.parquet
+*.pkl
+*.h5
+configs/local_*.yaml
+
+# Coverage
+.coverage
+htmlcov/
+.pytest_cache/
+
