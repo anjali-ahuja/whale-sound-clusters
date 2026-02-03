@@ -28,6 +28,7 @@ segmentation:
   max_duration_ms: 3000  # maximum segment duration
   merge_gap_ms: 200  # merge segments closer than this
   output_dir: "data/segments"
+  max_workers: null  # Number of parallel workers (null = auto-detect CPU count, otherwise capped at CPU count)
   
 # Feature extraction
 features:

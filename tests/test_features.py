@@ -115,3 +115,4 @@ def test_feature_output_shapes():
     assert len(features_mean_std) == 128  # 64 * 2
     assert len(features_flatten) > len(features_mean_std)  # Flattened is larger
 
+

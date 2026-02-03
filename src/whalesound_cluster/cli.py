@@ -399,23 +399,75 @@ def download_cmd():
     logger.info(f"Downloaded {len(downloaded)} files")
 
 
+def _process_single_audio_file(args):
+    """
+    Helper function to process a single audio file (for multiprocessing).
+    
+    Args:
+        args: Tuple of (audio_file, seg_cfg, audio_cfg, output_dir)
+    
+    Returns:
+        List of Segment objects or None if failed
+    """
+    audio_file, seg_cfg, audio_cfg, output_dir = args
+    
+    try:
+        from pathlib import Path
+        from whalesound_cluster.audio.segmenter import AudioSegmenter
+        from whalesound_cluster.audio.io import load_audio, save_audio
+        from whalesound_cluster.utils.logging import setup_logging
+        import numpy as np
+        import os
+        
+        logger = setup_logging()
+        
+        segmenter = AudioSegmenter(
+            frame_length_ms=seg_cfg["frame_length_ms"],
+            hop_length_ms=seg_cfg["hop_length_ms"],
+            energy_threshold=seg_cfg["energy_threshold"],
+            min_duration_ms=seg_cfg["min_duration_ms"],
+            max_duration_ms=seg_cfg["max_duration_ms"],
+            merge_gap_ms=seg_cfg["merge_gap_ms"],
+            sample_rate=audio_cfg["sample_rate"],
+        )
+        
+        # Handle bandpass filtering if enabled
+        if audio_cfg["bandpass"]["enabled"]:
+            audio, sr = load_audio(audio_file, sample_rate=audio_cfg["sample_rate"])
+            audio = segmenter.apply_bandpass(
+                audio,
+                audio_cfg["bandpass"]["fmin"],
+                audio_cfg["bandpass"]["fmax"],
+                sr,
+            )
+            # Use a unique temp file per process to avoid conflicts
+            temp_path = Path(output_dir) / f".temp_filtered_{os.getpid()}_{Path(audio_file).stem}.wav"
+            save_audio(audio, temp_path, sr)
+            audio_file = temp_path
+        
+        segments = segmenter.segment_file(
+            audio_file,
+            output_dir,
+            metadata={"source_file": str(audio_file)},
+        )
+        
+        return segments
+    except Exception as e:
+        logger.error(f"Failed to segment {audio_file}: {e}")
+        return None
+
+
 def segment_cmd():
     """Entry point for whale-segment command."""
+    import os
+    from concurrent.futures import ProcessPoolExecutor, as_completed
+    from tqdm import tqdm
+    
     cfg = load_config()
     audio_cfg = cfg["audio"]
     seg_cfg = cfg["segmentation"]
     input_dir = cfg["data"]["output_dir"]
     output_dir = seg_cfg["output_dir"]
-    
-    segmenter = AudioSegmenter(
-        frame_length_ms=seg_cfg["frame_length_ms"],
-        hop_length_ms=seg_cfg["hop_length_ms"],
-        energy_threshold=seg_cfg["energy_threshold"],
-        min_duration_ms=seg_cfg["min_duration_ms"],
-        max_duration_ms=seg_cfg["max_duration_ms"],
-        merge_gap_ms=seg_cfg["merge_gap_ms"],
-        sample_rate=audio_cfg["sample_rate"],
-    )
     
     input_path = Path(input_dir)
     audio_files = list(input_path.glob("**/*.wav")) + list(input_path.glob("**/*.flac"))
@@ -424,35 +476,55 @@ def segment_cmd():
         logger.warning(f"No audio files found in {input_dir}")
         return
     
-    logger.info(f"Segmenting {len(audio_files)} audio files")
+    # Determine number of workers with safe upper limit (CPU count)
+    cpu_count = os.cpu_count() or 4
+    max_workers_config = seg_cfg.get("max_workers")
+    if max_workers_config is None:
+        # Auto-detect: use CPU count
+        max_workers = cpu_count
+    else:
+        # User-specified, but cap at CPU count for safety
+        max_workers = min(int(max_workers_config), cpu_count)
+    
+    logger.info(f"Segmenting {len(audio_files)} audio files with {max_workers} workers")
+    
     all_segments = []
     metadata_file = Path(output_dir) / "segments_metadata.json"
     
-    for audio_file in audio_files:
+    # Prepare arguments for parallel processing
+    process_args = [
+        (audio_file, seg_cfg, audio_cfg, output_dir)
+        for audio_file in audio_files
+    ]
+    
+    # Process files in parallel
+    with ProcessPoolExecutor(max_workers=max_workers) as executor:
+        # Submit all tasks
+        future_to_file = {
+            executor.submit(_process_single_audio_file, args): args[0]
+            for args in process_args
+        }
+        
+        # Process results with progress bar
+        with tqdm(total=len(audio_files), desc="Segmenting files") as pbar:
+            for future in as_completed(future_to_file):
+                audio_file = future_to_file[future]
+                try:
+                    segments = future.result()
+                    if segments is not None:
+                        all_segments.extend(segments)
+                except Exception as e:
+                    logger.error(f"Error processing {audio_file}: {e}")
+                finally:
+                    pbar.update(1)
+    
+    # Clean up any temp files
+    temp_files = list(Path(output_dir).glob(".temp_filtered_*.wav"))
+    for temp_file in temp_files:
         try:
-            if audio_cfg["bandpass"]["enabled"]:
-                import numpy as np
-                from whalesound_cluster.audio.io import load_audio, save_audio
-                audio, sr = load_audio(audio_file, sample_rate=audio_cfg["sample_rate"])
-                audio = segmenter.apply_bandpass(
-                    audio,
-                    audio_cfg["bandpass"]["fmin"],
-                    audio_cfg["bandpass"]["fmax"],
-                    sr,
-                )
-                temp_path = Path(output_dir) / ".temp_filtered.wav"
-                save_audio(audio, temp_path, sr)
-                audio_file = temp_path
-            
-            segments = segmenter.segment_file(
-                audio_file,
-                output_dir,
-                metadata={"source_file": str(audio_file)},
-            )
-            all_segments.extend(segments)
-        except Exception as e:
-            logger.error(f"Failed to segment {audio_file}: {e}")
-            continue
+            temp_file.unlink()
+        except Exception:
+            pass
     
     segments_metadata = [
         {

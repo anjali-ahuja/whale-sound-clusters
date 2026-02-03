@@ -106,3 +106,4 @@ def test_bandpass_filter():
     assert len(filtered) == len(audio)
     assert not np.allclose(filtered, audio)  # Should be different
 
+

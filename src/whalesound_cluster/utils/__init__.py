@@ -5,3 +5,4 @@ from whalesound_cluster.utils.logging import setup_logging
 
 __all__ = ["load_config", "setup_logging"]
 
+

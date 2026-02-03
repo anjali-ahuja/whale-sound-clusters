@@ -120,3 +120,4 @@ def test_reproducibility():
     # Should produce same results
     np.testing.assert_array_equal(labels1, labels2)
 
+
