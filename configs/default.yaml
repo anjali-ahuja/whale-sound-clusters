@@ -36,6 +36,7 @@ features:
   output_dir: "data/features"
   use_full_audio: false  # If true, skip segmentation and use full audio files
   audio_dir: null  # Directory with full audio files (null = use data.output_dir)
+  max_segments: null  # Maximum number of segments to process (null = process all)
   
   # Log-mel spectrogram parameters
   logmel:

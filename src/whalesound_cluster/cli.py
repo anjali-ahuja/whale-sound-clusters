@@ -1,6 +1,7 @@
 """CLI entrypoints for pipeline commands."""
 
 import json
+import os
 from pathlib import Path
 from typing import Optional
 
@@ -117,11 +118,35 @@ def segment(config: Optional[str], input_dir: Optional[str], output_dir: Optiona
     
     logger.info(f"Segmenting {len(audio_files)} audio files")
     
+    # Clear existing metadata and segment files at the start
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+    metadata_file = output_path / "segments_metadata.json"
+    
+    # Create a separate temp directory for filtered audio files (completely isolated from segments)
+    temp_dir = output_path / ".temp_filtered"
+    temp_dir.mkdir(exist_ok=True)
+    
+    # Remove existing metadata file
+    if metadata_file.exists():
+        logger.info("Clearing existing metadata file")
+        metadata_file.unlink()
+    
+    # Remove existing segment files
+    existing_segments = list(output_path.glob("*_seg*.wav"))
+    if existing_segments:
+        logger.info(f"Clearing {len(existing_segments)} existing segment files")
+        for seg_file in existing_segments:
+            try:
+                seg_file.unlink()
+            except Exception as e:
+                logger.warning(f"Failed to remove {seg_file}: {e}")
+    
     # Segment each file
     all_segments = []
-    metadata_file = Path(output_dir) / "segments_metadata.json"
     
     for audio_file in audio_files:
+        temp_path = None
         try:
             # Apply bandpass if enabled
             if audio_cfg["bandpass"]["enabled"]:
@@ -135,9 +160,10 @@ def segment(config: Optional[str], input_dir: Optional[str], output_dir: Optiona
                     audio_cfg["bandpass"]["fmax"],
                     sr,
                 )
-                # Save filtered audio temporarily
+                # Save filtered audio temporarily in isolated temp directory
                 from whalesound_cluster.audio.io import save_audio
-                temp_path = Path(output_dir) / ".temp_filtered.wav"
+                # Use unique temp filename per source file
+                temp_path = temp_dir / f"{os.getpid()}_{Path(audio_file).stem}.wav"
                 save_audio(audio, temp_path, sr)
                 audio_file = temp_path
             
@@ -147,9 +173,41 @@ def segment(config: Optional[str], input_dir: Optional[str], output_dir: Optiona
                 metadata={"source_file": str(audio_file)},
             )
             all_segments.extend(segments)
+            
+            # Clean up temp file immediately after processing (segments are already saved)
+            if temp_path and temp_path.exists():
+                try:
+                    temp_path.unlink()
+                except Exception as e:
+                    logger.warning(f"Failed to remove temp file {temp_path}: {e}")
         except Exception as e:
             logger.error(f"Failed to segment {audio_file}: {e}")
+            # Clean up temp file even on error
+            if temp_path and temp_path.exists():
+                try:
+                    temp_path.unlink()
+                except Exception as cleanup_error:
+                    logger.warning(f"Failed to remove temp file {temp_path} after error: {cleanup_error}")
             continue
+    
+    # Clean up temp directory (should be empty, but remove any leftover files)
+    try:
+        if temp_dir.exists():
+            remaining_files = list(temp_dir.glob("*.wav"))
+            if remaining_files:
+                logger.warning(f"Cleaning up {len(remaining_files)} leftover temp files")
+                for f in remaining_files:
+                    try:
+                        f.unlink()
+                    except Exception as e:
+                        logger.warning(f"Failed to remove temp file {f}: {e}")
+            # Try to remove the directory (will fail if not empty, which is fine)
+            try:
+                temp_dir.rmdir()
+            except OSError:
+                pass  # Directory not empty, that's okay
+    except Exception as e:
+        logger.warning(f"Failed to clean up temp directory {temp_dir}: {e}")
     
     # Save metadata
     segments_metadata = [
@@ -163,10 +221,33 @@ def segment(config: Optional[str], input_dir: Optional[str], output_dir: Optiona
         for s in all_segments
     ]
     
+    # Verify segment files exist
+    segment_files = list(output_path.glob("*_seg*.wav"))
+    segment_file_ids = {f.stem for f in segment_files}
+    segment_metadata_ids = {s["segment_id"] for s in segments_metadata}
+    
+    missing_files = segment_metadata_ids - segment_file_ids
+    if missing_files:
+        logger.warning(
+            f"Found {len(missing_files)} segments in metadata but missing segment files. "
+            f"First few missing: {list(missing_files)[:5]}"
+        )
+        # Only include segments that have files in the metadata
+        segments_metadata = [
+            s for s in segments_metadata if s["segment_id"] in segment_file_ids
+        ]
+        logger.warning(
+            f"Reduced metadata to {len(segments_metadata)} segments that have corresponding files"
+        )
+    
     with open(metadata_file, "w") as f:
         json.dump(segments_metadata, f, indent=2)
     
-    logger.info(f"Created {len(all_segments)} segments")
+    logger.info(
+        f"Created {len(all_segments)} segments, "
+        f"{len(segment_files)} segment files found, "
+        f"{len(segments_metadata)} segments in metadata"
+    )
 
 
 @cli.command()
@@ -254,18 +335,99 @@ def featurize(
         segments_path = Path(segments_dir)
         segment_files = list(segments_path.glob("*.wav"))
         
-        if not segment_files:
-            logger.warning(f"No segment files found in {segments_dir}")
+        # Filter out temp files
+        segment_files = [f for f in segment_files if not f.name.startswith(".temp")]
+        
+        if not segment_files and segments_metadata:
+            # No segment files found, but we have metadata - extract from source files
+            logger.info(
+                f"No segment files found in {segments_dir}, but found {len(segments_metadata)} segments in metadata. "
+                "Extracting features from source audio files using segment timestamps."
+            )
+            
+            # Resolve source file paths
+            data_dir = Path(cfg["data"]["output_dir"])
+            resolved_metadata = []
+            for seg_meta in segments_metadata:
+                source_file = seg_meta.get("source_file", "")
+                if source_file:
+                    source_path = Path(source_file)
+                    resolved_path = None
+                    
+                    # Check if it's a temp file (starts with .temp_filtered_)
+                    if source_path.name.startswith(".temp_filtered_"):
+                        # Extract original filename: .temp_filtered_<pid>_<original>.wav -> <original>.flac
+                        # Pattern: .temp_filtered_<numbers>_<original_filename>.wav
+                        temp_name = source_path.stem  # Remove .wav extension
+                        # Remove .temp_filtered_ prefix
+                        if temp_name.startswith(".temp_filtered_"):
+                            # Find the first underscore after the prefix, then find the next one after the PID
+                            # .temp_filtered_3292_SanctSound_CI01_01_671379494_20181122T145632Z
+                            # We want: SanctSound_CI01_01_671379494_20181122T145632Z
+                            parts = temp_name.replace(".temp_filtered_", "", 1).split("_", 1)
+                            if len(parts) == 2:
+                                # parts[0] is the PID, parts[1] is the original filename
+                                original_name = parts[1]
+                                # Try to find the original file (could be .flac or .wav)
+                                for ext in [".flac", ".wav"]:
+                                    found_files = list(data_dir.glob(f"**/{original_name}{ext}"))
+                                    if found_files:
+                                        resolved_path = found_files[0]
+                                        break
+                    
+                    # If not resolved yet, try direct path resolution
+                    if not resolved_path:
+                        if source_path.is_absolute() and source_path.exists():
+                            resolved_path = source_path
+                        elif (data_dir / source_path).exists():
+                            resolved_path = data_dir / source_path
+                        elif (segments_path / source_path).exists():
+                            resolved_path = segments_path / source_path
+                        else:
+                            # Try to find by filename
+                            filename = source_path.name
+                            found_files = list(data_dir.glob(f"**/{filename}"))
+                            if found_files:
+                                resolved_path = found_files[0]
+                    
+                    if resolved_path and resolved_path.exists():
+                        seg_meta["source_file"] = str(resolved_path)
+                        resolved_metadata.append(seg_meta)
+                    else:
+                        logger.warning(f"Could not resolve source file: {source_file}, skipping segment")
+                        continue
+                else:
+                    logger.warning(f"Segment {seg_meta.get('segment_id')} missing source_file, skipping")
+            
+            if not resolved_metadata:
+                logger.error("Could not resolve any source files from metadata")
+                return
+            
+            logger.info(f"Resolved {len(resolved_metadata)} segments from {len(segments_metadata)} total segments")
+            
+            # Optionally limit number of segments for testing/faster processing
+            max_segments = feat_cfg.get("max_segments")
+            if max_segments and len(resolved_metadata) > max_segments:
+                logger.info(f"Limiting to {max_segments} segments (out of {len(resolved_metadata)} total)")
+                resolved_metadata = resolved_metadata[:max_segments]
+            else:
+                logger.info(f"Processing all {len(resolved_metadata)} segments")
+            
+            logger.info(f"Extracting features from {len(resolved_metadata)} segments using source files")
+            df = extractor.extract_batch_from_metadata(resolved_metadata, output_path)
+        elif segment_files:
+            # Use existing segment files
+            logger.info(f"Extracting features from {len(segment_files)} segment files")
+            
+            # Create metadata dict
+            metadata_dict = {m["segment_id"]: m for m in segments_metadata}
+            
+            # Extract features
+            metadata_list = [metadata_dict.get(f.stem, {}) for f in segment_files]
+            df = extractor.extract_batch(segment_files, metadata_list, output_path)
+        else:
+            logger.error(f"No segment files found in {segments_dir} and no metadata available")
             return
-        
-        logger.info(f"Extracting features from {len(segment_files)} segments")
-        
-        # Create metadata dict
-        metadata_dict = {m["segment_id"]: m for m in segments_metadata}
-        
-        # Extract features
-        metadata_list = [metadata_dict.get(f.stem, {}) for f in segment_files]
-        df = extractor.extract_batch(segment_files, metadata_list, output_path)
     
     logger.info(f"Extracted features: {df.shape}")
 
@@ -439,7 +601,6 @@ def _process_single_audio_file(args):
         from whalesound_cluster.audio.io import load_audio, save_audio
         from whalesound_cluster.utils.logging import setup_logging
         import numpy as np
-        import os
         
         logger = setup_logging()
         
@@ -462,11 +623,40 @@ def _process_single_audio_file(args):
                 audio_cfg["bandpass"]["fmax"],
                 sr,
             )
-            # Use a unique temp file per process to avoid conflicts
-            temp_path = Path(output_dir) / f".temp_filtered_{os.getpid()}_{Path(audio_file).stem}.wav"
-            save_audio(audio, temp_path, sr)
-            audio_file = temp_path
+            
+            # Ensure segmenter uses the actual sample rate
+            if sr != segmenter.sample_rate:
+                segmenter.sample_rate = sr
+                segmenter.frame_length = int(segmenter.frame_length_ms * sr / 1000)
+                segmenter.hop_length = int(segmenter.hop_length_ms * sr / 1000)
+                segmenter.min_duration = int(segmenter.min_duration_ms * sr / 1000)
+                segmenter.max_duration = int(segmenter.max_duration_ms * sr / 1000)
+                segmenter.merge_gap = int(segmenter.merge_gap_ms * sr / 1000)
+            
+            metadata = {
+                "source_file": str(audio_file),
+                "sample_rate": sr,
+                "original_length": len(audio) / sr,
+            }
+            
+            segments = segmenter.segment_audio(audio, str(audio_file), metadata)
+            
+            # Save segments (use original filename stem for segment IDs)
+            output_path = Path(output_dir)
+            saved_count = 0
+            for segment in segments:
+                seg_path = output_path / f"{segment.segment_id}.wav"
+                save_audio(segment.audio, seg_path, segmenter.sample_rate)
+                if not seg_path.exists():
+                    raise FileNotFoundError(f"Segment file was not created: {seg_path}")
+                saved_count += 1
+            
+            if saved_count > 0:
+                logger.debug(f"Saved {saved_count} segments from {Path(audio_file).name}")
+            
+            return segments
         
+        # If bandpass is disabled, use the existing segmenter file path for efficiency
         segments = segmenter.segment_file(
             audio_file,
             output_dir,
@@ -549,8 +739,27 @@ def segment_cmd():
     
     logger.info(f"Segmenting {len(audio_files)} audio files with {max_workers} workers")
     
+    # Clear existing metadata and segment files at the start
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+    metadata_file = output_path / "segments_metadata.json"
+    
+    # Remove existing metadata file
+    if metadata_file.exists():
+        logger.info("Clearing existing metadata file")
+        metadata_file.unlink()
+    
+    # Remove existing segment files (but keep temp files for now, they'll be cleaned up later)
+    existing_segments = list(output_path.glob("*_seg*.wav"))
+    if existing_segments:
+        logger.info(f"Clearing {len(existing_segments)} existing segment files")
+        for seg_file in existing_segments:
+            try:
+                seg_file.unlink()
+            except Exception as e:
+                logger.warning(f"Failed to remove {seg_file}: {e}")
+    
     all_segments = []
-    metadata_file = Path(output_dir) / "segments_metadata.json"
     
     # Prepare arguments for parallel processing
     process_args = [
@@ -579,14 +788,6 @@ def segment_cmd():
                 finally:
                     pbar.update(1)
     
-    # Clean up any temp files
-    temp_files = list(Path(output_dir).glob(".temp_filtered_*.wav"))
-    for temp_file in temp_files:
-        try:
-            temp_file.unlink()
-        except Exception:
-            pass
-    
     segments_metadata = [
         {
             "segment_id": s.segment_id,
@@ -598,10 +799,34 @@ def segment_cmd():
         for s in all_segments
     ]
     
+    # Verify segment files exist
+    output_path = Path(output_dir)
+    segment_files = list(output_path.glob("*_seg*.wav"))
+    segment_file_ids = {f.stem for f in segment_files}
+    segment_metadata_ids = {s["segment_id"] for s in segments_metadata}
+    
+    missing_files = segment_metadata_ids - segment_file_ids
+    if missing_files:
+        logger.warning(
+            f"Found {len(missing_files)} segments in metadata but missing segment files. "
+            f"First few missing: {list(missing_files)[:5]}"
+        )
+        # Only include segments that have files in the metadata
+        segments_metadata = [
+            s for s in segments_metadata if s["segment_id"] in segment_file_ids
+        ]
+        logger.warning(
+            f"Reduced metadata to {len(segments_metadata)} segments that have corresponding files"
+        )
+    
     with open(metadata_file, "w") as f:
         json.dump(segments_metadata, f, indent=2)
     
-    logger.info(f"Created {len(all_segments)} segments")
+    logger.info(
+        f"Created {len(all_segments)} segments, "
+        f"{len(segment_files)} segment files found, "
+        f"{len(segments_metadata)} segments in metadata"
+    )
 
 
 def featurize_cmd():
@@ -688,15 +913,89 @@ def featurize_cmd():
         segments_path = Path(segments_dir)
         segment_files = list(segments_path.glob("*.wav"))
         
-        if not segment_files:
-            logger.warning(f"No segment files found in {segments_dir}")
+        # Filter out temp files
+        segment_files = [f for f in segment_files if not f.name.startswith(".temp")]
+        
+        if not segment_files and segments_metadata:
+            # No segment files found, but we have metadata - extract from source files
+            logger.info(
+                f"No segment files found in {segments_dir}, but found {len(segments_metadata)} segments in metadata. "
+                "Extracting features from source audio files using segment timestamps."
+            )
+            
+            # Resolve source file paths
+            data_dir = Path(cfg["data"]["output_dir"])
+            resolved_metadata = []
+            for seg_meta in segments_metadata:
+                source_file = seg_meta.get("source_file", "")
+                if source_file:
+                    source_path = Path(source_file)
+                    resolved_path = None
+                    
+                    # Check if it's a temp file (starts with .temp_filtered_)
+                    if source_path.name.startswith(".temp_filtered_"):
+                        # Extract original filename: .temp_filtered_<pid>_<original>.wav -> <original>.flac
+                        temp_name = source_path.stem
+                        if temp_name.startswith(".temp_filtered_"):
+                            parts = temp_name.replace(".temp_filtered_", "", 1).split("_", 1)
+                            if len(parts) == 2:
+                                original_name = parts[1]
+                                # Try to find the original file (could be .flac or .wav)
+                                for ext in [".flac", ".wav"]:
+                                    found_files = list(data_dir.glob(f"**/{original_name}{ext}"))
+                                    if found_files:
+                                        resolved_path = found_files[0]
+                                        break
+                    
+                    # If not resolved yet, try direct path resolution
+                    if not resolved_path:
+                        if source_path.is_absolute() and source_path.exists():
+                            resolved_path = source_path
+                        elif (data_dir / source_path).exists():
+                            resolved_path = data_dir / source_path
+                        elif (segments_path / source_path).exists():
+                            resolved_path = segments_path / source_path
+                        else:
+                            # Try to find by filename
+                            filename = source_path.name
+                            found_files = list(data_dir.glob(f"**/{filename}"))
+                            if found_files:
+                                resolved_path = found_files[0]
+                    
+                    if resolved_path and resolved_path.exists():
+                        seg_meta["source_file"] = str(resolved_path)
+                        resolved_metadata.append(seg_meta)
+                    else:
+                        logger.warning(f"Could not resolve source file: {source_file}, skipping segment")
+                        continue
+                else:
+                    logger.warning(f"Segment {seg_meta.get('segment_id')} missing source_file, skipping")
+            
+            if not resolved_metadata:
+                logger.error("Could not resolve any source files from metadata")
+                return
+            
+            logger.info(f"Resolved {len(resolved_metadata)} segments from {len(segments_metadata)} total segments")
+            
+            # Optionally limit number of segments for testing/faster processing
+            max_segments = feat_cfg.get("max_segments")
+            if max_segments and len(resolved_metadata) > max_segments:
+                logger.info(f"Limiting to {max_segments} segments (out of {len(resolved_metadata)} total)")
+                resolved_metadata = resolved_metadata[:max_segments]
+            else:
+                logger.info(f"Processing all {len(resolved_metadata)} segments")
+            
+            logger.info(f"Extracting features from {len(resolved_metadata)} segments using source files")
+            df = extractor.extract_batch_from_metadata(resolved_metadata, output_path)
+        elif segment_files:
+            # Use existing segment files
+            logger.info(f"Extracting features from {len(segment_files)} segment files")
+            metadata_dict = {m["segment_id"]: m for m in segments_metadata}
+            metadata_list = [metadata_dict.get(f.stem, {}) for f in segment_files]
+            df = extractor.extract_batch(segment_files, metadata_list, output_path)
+        else:
+            logger.error(f"No segment files found in {segments_dir} and no metadata available")
             return
-        
-        logger.info(f"Extracting features from {len(segment_files)} segments")
-        metadata_dict = {m["segment_id"]: m for m in segments_metadata}
-        
-        metadata_list = [metadata_dict.get(f.stem, {}) for f in segment_files]
-        df = extractor.extract_batch(segment_files, metadata_list, output_path)
     
     logger.info(f"Extracted features: {df.shape}")
 

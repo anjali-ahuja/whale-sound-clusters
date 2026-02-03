@@ -86,6 +86,26 @@ class ClusteringPipeline:
         else:
             X = features
         
+        n_samples = X.shape[0]
+        min_samples_needed = self.umap.n_neighbors + 1
+        
+        if n_samples < min_samples_needed:
+            logger.warning(
+                f"Insufficient samples for UMAP: {n_samples} < {min_samples_needed} "
+                f"(n_neighbors={self.umap.n_neighbors}). "
+                f"Returning original features as embeddings."
+            )
+            # Return original features (or a subset if needed)
+            if X.shape[1] >= self.umap.n_components:
+                # Use PCA-like approach: just take first n_components
+                embeddings = X[:, :self.umap.n_components]
+            else:
+                # Pad with zeros if needed
+                embeddings = np.zeros((n_samples, self.umap.n_components))
+                embeddings[:, :X.shape[1]] = X
+            logger.info(f"Returned embeddings shape: {embeddings.shape}")
+            return embeddings
+        
         logger.info(f"Applying UMAP to {X.shape[0]} samples, {X.shape[1]} features")
         embeddings = self.umap.fit_transform(X)
         logger.info(f"UMAP embeddings shape: {embeddings.shape}")
@@ -113,6 +133,21 @@ class ClusteringPipeline:
             X = features[feature_cols].values
         else:
             X = features
+        
+        n_samples = X.shape[0]
+        min_samples_needed = max(self.hdbscan.min_cluster_size, self.hdbscan.min_samples)
+        
+        if n_samples < min_samples_needed:
+            logger.warning(
+                f"Insufficient samples for HDBSCAN: {n_samples} < {min_samples_needed} "
+                f"(min_cluster_size={self.hdbscan.min_cluster_size}, "
+                f"min_samples={self.hdbscan.min_samples}). "
+                f"All points will be labeled as noise (-1)."
+            )
+            # Return all noise labels
+            labels = np.full(n_samples, -1, dtype=int)
+            logger.info(f"All {n_samples} samples labeled as noise (insufficient data for clustering)")
+            return labels
         
         logger.info(f"Clustering {X.shape[0]} samples")
         labels = self.hdbscan.fit_predict(X)
@@ -252,8 +287,31 @@ class ClusteringPipeline:
         if feature_cols is None:
             feature_cols = [c for c in features_df.columns if c.startswith("feat_")]
         
-        # UMAP
+        n_samples = len(features_df)
+        min_samples_for_clustering = max(
+            self.umap.n_neighbors + 1,
+            max(self.hdbscan.min_cluster_size, self.hdbscan.min_samples)
+        )
+        
+        # UMAP (will handle insufficient samples gracefully)
         embeddings = self.fit_transform(features_df, feature_cols)
+        
+        if n_samples < min_samples_for_clustering:
+            logger.warning(
+                f"Insufficient samples for clustering: {n_samples} < {min_samples_for_clustering}. "
+                f"Need at least {self.umap.n_neighbors + 1} for UMAP and "
+                f"{max(self.hdbscan.min_cluster_size, self.hdbscan.min_samples)} for HDBSCAN. "
+                f"Please extract features from more segments. "
+                f"All points will be labeled as noise (-1)."
+            )
+            # Still create output files but with noise labels
+            labels = np.full(n_samples, -1, dtype=int)
+            confidence = np.zeros(n_samples)
+        else:
+            # HDBSCAN - cluster on UMAP embeddings so clusters align with visualization
+            logger.info(f"Clustering on UMAP embeddings ({embeddings.shape[1]}D)")
+            labels = self.cluster(embeddings)
+            confidence = self.compute_cluster_confidence(labels)
         
         # Add UMAP columns
         if embeddings.shape[1] == 2:
@@ -263,19 +321,16 @@ class ClusteringPipeline:
             for i in range(embeddings.shape[1]):
                 features_df[f"umap_{i}"] = embeddings[:, i]
         
-        # HDBSCAN - cluster on UMAP embeddings so clusters align with visualization
-        logger.info(f"Clustering on UMAP embeddings ({embeddings.shape[1]}D)")
-        labels = self.hdbscan.fit_predict(embeddings)
         features_df["cluster_id"] = labels
-        
-        # Confidence
-        confidence = self.compute_cluster_confidence(labels)
         features_df["cluster_confidence"] = confidence
         
-        # Exemplars
-        exemplars = self.find_exemplars(
-            features_df, labels, n_per_cluster=n_exemplars
-        )
+        # Exemplars (only if we have clusters)
+        if len(set(labels)) > 1 or (len(set(labels)) == 1 and -1 not in labels):
+            exemplars = self.find_exemplars(
+                features_df, labels, n_per_cluster=n_exemplars
+            )
+        else:
+            exemplars = {}
         
         # Save results
         output_path = output_dir / "clusters.parquet"

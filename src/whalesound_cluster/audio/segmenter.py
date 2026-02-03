@@ -321,9 +321,22 @@ class AudioSegmenter:
         segments = self.segment_audio(audio, str(file_path), metadata)
         
         # Save segments
+        saved_count = 0
         for segment in segments:
             output_path = output_dir / f"{segment.segment_id}.wav"
-            save_audio(segment.audio, output_path, self.sample_rate)
+            try:
+                save_audio(segment.audio, output_path, self.sample_rate)
+                # Verify file was actually created
+                if not output_path.exists():
+                    logger.error(f"Segment file was not created: {output_path}")
+                    raise FileNotFoundError(f"Segment file was not created: {output_path}")
+                saved_count += 1
+            except Exception as e:
+                logger.error(f"Failed to save segment {segment.segment_id} to {output_path}: {e}")
+                raise
+        
+        if saved_count > 0:
+            logger.debug(f"Saved {saved_count} segments from {file_path.name}")
         
         return segments
 
