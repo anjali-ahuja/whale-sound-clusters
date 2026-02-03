@@ -9,7 +9,7 @@ data:
   max_files: 200
   date_range: null  # null or {"start": "2020-01-01", "end": "2020-12-31"}
   output_dir: "data/downloads"
-  skip_existing: false  # If true, skip downloading files that already exist locally
+  skip_existing: true  # If true, skip downloading files that already exist locally (enables incremental downloads)
   
 # Audio processing
 audio:

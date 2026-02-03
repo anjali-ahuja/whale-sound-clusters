@@ -263,7 +263,7 @@ class GCSDownloader:
         
         Args:
             files: Pre-computed list of files. If None, will list files.
-            max_files: Maximum files to download
+            max_files: Maximum files to download (new files only if skip_existing=True)
             date_range: Date range filter
             pattern: Filename pattern filter
             skip_existing: If True, skip download if file already exists
@@ -272,7 +272,50 @@ class GCSDownloader:
             List of downloaded file paths (including existing files if skip_existing=True)
         """
         if files is None:
-            files = self.list_files(max_files=max_files, date_range=date_range, pattern=pattern)
+            # If skip_existing is True and max_files is set, we need to filter out
+            # existing files first, then apply max_files to get the next N new files
+            if skip_existing and max_files is not None:
+                # List files without max_files limit first
+                all_files = self.list_files(max_files=None, date_range=date_range, pattern=pattern)
+                
+                # Filter out files that already exist locally
+                new_files = []
+                skipped_files = []
+                for gcs_path in all_files:
+                    # Determine local path (list_files returns blob paths)
+                    # Use the same logic as download_file for consistency
+                    rel_path = gcs_path.replace(self.prefix, "").lstrip("/")
+                    local_path = self.output_dir / rel_path
+                    
+                    # Check if file exists and is not empty
+                    if local_path.exists() and local_path.stat().st_size > 0:
+                        skipped_files.append(local_path)
+                        # Log first few skipped files at INFO level, rest at DEBUG
+                        if len(skipped_files) <= 5:
+                            logger.info(f"Skipping existing file: {local_path.name}")
+                        else:
+                            logger.debug(f"Skipping existing file: {local_path.name}")
+                    else:
+                        new_files.append(gcs_path)
+                    
+                    # Stop once we have enough new files
+                    if len(new_files) >= max_files:
+                        break
+                
+                files = new_files
+                skipped_count = len(skipped_files)
+                if skipped_count > 0:
+                    logger.info(
+                        f"Filtered to {len(files)} new files (skipping {skipped_count} existing files)"
+                    )
+                    if skipped_count > 5:
+                        logger.debug(
+                            f"Skipped {skipped_count - 5} additional existing files "
+                            f"(use DEBUG logging level to see all skipped files)"
+                        )
+            else:
+                # Normal behavior: list files with max_files limit
+                files = self.list_files(max_files=max_files, date_range=date_range, pattern=pattern)
         
         downloaded = []
         skipped = []
@@ -296,6 +339,7 @@ class GCSDownloader:
                     if local_path is not None and local_path.exists() and local_path.stat().st_size > 0:
                         downloaded.append(local_path)
                         skipped.append(local_path)
+                        logger.debug(f"Skipping existing file: {local_path.name}")
                         pbar.set_postfix({
                             "new": len(downloaded) - len(skipped),
                             "skipped": len(skipped),
@@ -329,6 +373,13 @@ class GCSDownloader:
             f"{len(skipped)} already existed, {len(failed)} failed "
             f"out of {len(files)} total files"
         )
+        if skipped:
+            # Show sample of skipped files
+            sample_size = min(5, len(skipped))
+            skipped_sample = [p.name for p in skipped[:sample_size]]
+            logger.info(f"Skipped files (showing {sample_size} of {len(skipped)}): {', '.join(skipped_sample)}")
+            if len(skipped) > sample_size:
+                logger.debug(f"Additional {len(skipped) - sample_size} skipped files (use DEBUG logging to see all)")
         if downloaded:
             logger.info(f"Total files available: {len(downloaded)} in {self.output_dir}")
         if failed:
@@ -336,6 +387,10 @@ class GCSDownloader:
                 f"{len(failed)} files failed to download. "
                 "Check GCS bucket access and file paths."
             )
+            # Show sample of failed files
+            sample_size = min(5, len(failed))
+            failed_sample = failed[:sample_size]
+            logger.warning(f"Failed files (showing {sample_size} of {len(failed)}): {', '.join(failed_sample)}")
         
         return downloaded
 
