@@ -382,9 +382,31 @@ def pipeline(config: Optional[str], skip_existing: Optional[bool]):
 def download_cmd():
     """Entry point for whale-download command."""
     import sys
-    cfg = load_config()
+    import argparse
+    
+    # Parse command-line arguments
+    parser = argparse.ArgumentParser(description="Download audio files from GCS")
+    parser.add_argument("--max-files", type=int, default=None, help="Maximum files to download")
+    parser.add_argument("--skip-existing", action="store_true", help="Skip files that already exist locally")
+    parser.add_argument("--config", type=str, default=None, help="Path to config file")
+    
+    # Parse known args only (in case there are other args we don't know about)
+    args, _ = parser.parse_known_args()
+    
+    cfg = load_config(args.config)
     data_cfg = cfg["data"]
-    skip_existing = data_cfg.get("skip_existing", False)
+    
+    # Override with CLI args
+    max_files = args.max_files if args.max_files is not None else data_cfg.get("max_files")
+    
+    # Use CLI flag if provided, otherwise use config
+    # Check if --skip-existing was explicitly provided in command line
+    skip_existing_provided = "--skip-existing" in sys.argv
+    if skip_existing_provided:
+        skip_existing = args.skip_existing
+    else:
+        skip_existing = data_cfg.get("skip_existing", False)
+    
     downloader = GCSDownloader(
         bucket_name=data_cfg["gcs_bucket"],
         prefix=data_cfg["gcs_prefix"],
@@ -392,7 +414,7 @@ def download_cmd():
         method=data_cfg["download_method"],
     )
     downloaded = downloader.download_batch(
-        max_files=data_cfg.get("max_files"),
+        max_files=max_files,
         date_range=data_cfg.get("date_range"),
         skip_existing=skip_existing,
     )
