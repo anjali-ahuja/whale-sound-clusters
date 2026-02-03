@@ -498,15 +498,54 @@ def segment_cmd():
         logger.warning(f"No audio files found in {input_dir}")
         return
     
-    # Determine number of workers with safe upper limit (CPU count)
+    # Check for large files and warn about memory usage
+    large_files = []
+    total_size_gb = 0
+    for f in audio_files:
+        try:
+            size_mb = f.stat().st_size / (1024 * 1024)
+            total_size_gb += size_mb / 1024
+            if size_mb > 500:  # Files larger than 500MB
+                large_files.append((f, size_mb))
+        except OSError:
+            continue
+    
+    if large_files:
+        logger.warning(
+            f"Found {len(large_files)} large audio files (>500MB). "
+            f"Total data size: ~{total_size_gb:.1f}GB. "
+            f"Processing many large files simultaneously may require significant memory. "
+            f"Consider reducing max_workers if you encounter memory issues."
+        )
+    
+    # Determine number of workers with safe defaults to prevent system overload
     cpu_count = os.cpu_count() or 4
     max_workers_config = seg_cfg.get("max_workers")
+    
     if max_workers_config is None:
-        # Auto-detect: use CPU count
-        max_workers = cpu_count
+        # Conservative default: use min(4, max(1, cpu_count - 2)) to leave resources for system
+        # This prevents overwhelming the system with too many large audio files in memory
+        # Formula ensures: at most 4 workers, at least 1 worker, and leaves 2 cores for system
+        max_workers = min(4, max(1, cpu_count - 2))
+        logger.info(
+            f"Auto-detected {cpu_count} CPU cores. Using {max_workers} workers by default "
+            f"(conservative setting to prevent system overload). "
+            f"Set 'max_workers' in config to override."
+        )
     else:
         # User-specified, but cap at CPU count for safety
         max_workers = min(int(max_workers_config), cpu_count)
+        if max_workers >= cpu_count:
+            logger.warning(
+                f"Using {max_workers} workers (all CPU cores). "
+                f"This may cause high memory usage and system slowdown. "
+                f"Consider using fewer workers (e.g., {min(4, max(1, cpu_count - 2))}) for large files."
+            )
+        elif max_workers > 6:
+            logger.warning(
+                f"Using {max_workers} workers. Processing large audio files ({len(audio_files)} files) "
+                f"with many workers may cause high memory usage. Monitor system resources."
+            )
     
     logger.info(f"Segmenting {len(audio_files)} audio files with {max_workers} workers")
     
