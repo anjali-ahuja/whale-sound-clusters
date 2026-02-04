@@ -195,7 +195,7 @@ def run_app(
             ]
     
     # Limit display
-    max_display = st.sidebar.slider("Max points to display", 100, 10000, 5000)
+    max_display = st.sidebar.slider("Max points to display", 100, 10000, 500)
     if len(filtered_df) > max_display:
         filtered_df = filtered_df.sample(n=max_display, random_state=42)
     
